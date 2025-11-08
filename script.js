@@ -306,14 +306,27 @@
           allowWeb: true  // let the Worker do real-time web search + citations
         })
       });
-      if (!res.ok) throw new Error(`AI error ${res.status}`);
-      const data = await res.json();
-      return data.reply?.trim() || null;
-    } catch (e) {
-      console.info('[AI] Error:', e.message);
-      return null;
+      const text = await res.text();
+    // Log raw for debugging
+    console.log('[AI] status=', res.status, 'body=', text);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
+
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error('Invalid JSON from worker'); }
+
+    if (data.error) {
+      // Show the worker error to the user instead of generic fallback
+      return `⚠️ AI service error: ${data.error}`;
     }
+    if (!data.reply) {
+      return '⚠️ Worker responded but did not include a reply.';
+    }
+    return String(data.reply).trim();
+  } catch (e) {
+    console.error('[AI] fetch failed:', e);
+    return `⚠️ ${e.message || 'AI request failed'}`;
   }
+}
 
   // ---------- Events ----------
   function wireEvents() {
