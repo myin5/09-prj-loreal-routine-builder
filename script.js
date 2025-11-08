@@ -54,16 +54,13 @@
       .bubble.user{ background: rgba(255,0,59,0.12); }
       .routine-block{ border:1px dashed rgba(0,0,0,.15); }
       .badge{ display:inline-block; font-size:11px; padding:3px 8px; border-radius:999px; background:rgba(227,165,53,.14); color:#5b430f; border:1px solid rgba(227,165,53,.45); }
-      /* details expander */
       .desc{ display:none; font-size:13px; color:#444; margin-top:8px; line-height:1.45; }
       .desc.open{ display:block; }
       .product-actions{ display:flex; gap:8px; align-items:center; margin-top:8px; }
       .link-btn, .toggle-btn{ font-size:13px; border:1px solid #ccc; background:#fff; padding:6px 8px; border-radius:6px; cursor:pointer; }
       .toggle-btn.active{ border-color: var(--brand-secondary); box-shadow:0 0 0 2px rgba(227,165,53,.25) inset; }
       .selected-toolbar{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
-      .clear-all{ border:1px solid #ccc; background:#fff; padding:6px 10px; border-radius:6px; cursor:pointer; }
-
-      /* RTL adjustments */
+      .clear-all{ border:1px solid #ccc; background:#fff; padding:6px 10px; cursor:pointer; border-radius:6px; }
       [dir="rtl"] .products-grid { direction: rtl; }
       [dir="rtl"] .chat-form { direction: rtl; }
       [dir="rtl"] .bubble.user { margin-right: auto; margin-left: 0; }
@@ -128,7 +125,6 @@
     wireEvents();
     pushAssistant("Hi! Pick a few products or tell me your skin goals. When you're ready, tap Generate Routine.");
 
-    // Restore RTL preference
     const dirPref = localStorage.getItem('ui.dir');
     if (dirPref) document.documentElement.setAttribute('dir', dirPref);
   }
@@ -188,7 +184,6 @@
 
       card.append(img, info, actions, desc);
 
-      // Click card itself toggles selection (not when clicking buttons)
       card.addEventListener('click', (e) => {
         if (e.target.closest('button')) return;
         toggleSelect(p);
@@ -207,7 +202,6 @@
   }
 
   function renderSelected() {
-    // Toolbar with Clear All
     if (!document.getElementById('selectedToolbar')) {
       const holder = document.querySelector('.selected-products');
       if (holder) {
@@ -245,7 +239,7 @@
     if (cat.includes('suncare') || /\bspf\b|sunscreen/.test(text)) return 'spf';
     if (cat.includes('skincare')) {
       if (/\beye\b/.test(text)) return 'eye';
-      return 'treat'; // default treatments
+      return 'treat';
     }
     return null;
   }
@@ -292,41 +286,69 @@
     els.chatWin.appendChild(bubble); els.chatWin.scrollTop = els.chatWin.scrollHeight;
   }
 
-  
-  
+  // ---------- AI (your Worker returns raw OpenAI JSON) ----------
   const WORKER_URL = 'https://project8-chatbot.myin5.workers.dev/';
-  async function callAI(messages, selectedProducts) {
+
+  async function callAI(messages) {
     try {
       const res = await fetch(WORKER_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages,
-          selected: selectedProducts,
-          allowWeb: true  // let the Worker do real-time web search + citations
-        })
+        body: JSON.stringify({ messages })
       });
       const text = await res.text();
-    // Log raw for debugging
-    console.log('[AI] status=', res.status, 'body=', text);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
+      console.log('[AI] status=', res.status, 'body=', text);
+      if (!res.ok) return `⚠️ Worker error ${res.status}: ${text}`;
 
-    let data;
-    try { data = JSON.parse(text); } catch { throw new Error('Invalid JSON from worker'); }
+      let data;
+      try { data = JSON.parse(text); } catch { return '⚠️ Worker returned invalid JSON.'; }
 
-    if (data.error) {
-      // Show the worker error to the user instead of generic fallback
-      return `⚠️ AI service error: ${data.error}`;
+      if (data.error) {
+        const msg = data.error.message || data.error || 'Unknown OpenAI error.';
+        return `⚠️ OpenAI error: ${msg}`;
+      }
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) return '⚠️ No content in OpenAI response.';
+      return String(content).trim();
+    } catch (e) {
+      console.error('[AI] fetch failed:', e);
+      return `⚠️ ${e.message || 'AI request failed'}`;
     }
-    if (!data.reply) {
-      return '⚠️ Worker responded but did not include a reply.';
-    }
-    return String(data.reply).trim();
-  } catch (e) {
-    console.error('[AI] fetch failed:', e);
-    return `⚠️ ${e.message || 'AI request failed'}`;
   }
-}
+
+  // Guardrail + context to include selected products in messages
+  const SYSTEM_PROMPT =
+    "You are a L’Oréal-focused advisor. Stay on topics: skincare, haircare, makeup, fragrance. " +
+    "Use only the provided selected product JSON and user questions to create AM/PM routines and give follow-ups. " +
+    "Be practical, concise, and safe. If something is outside scope, briefly say so.";
+
+  function buildMessagesForRoutine(selectedProducts, chatHistory) {
+    const context = {
+      selectedProducts: selectedProducts.map(p => ({
+        id: p.id, brand: p.brand, name: p.name, category: p.category, description: p.description
+      }))
+    };
+    return [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: JSON.stringify(context) },
+      ...chatHistory,
+      { role: 'user', content: "Generate a clear AM/PM routine using only the selected products. Then ask one short follow-up question." }
+    ];
+  }
+
+  function buildMessagesForFollowUp(selectedProducts, chatHistory, userMsg) {
+    const context = {
+      selectedProducts: selectedProducts.map(p => ({
+        id: p.id, brand: p.brand, name: p.name, category: p.category, description: p.description
+      }))
+    };
+    return [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: JSON.stringify(context) },
+      ...chatHistory,
+      { role: 'user', content: userMsg }
+    ];
+  }
 
   // ---------- Events ----------
   function wireEvents() {
@@ -338,16 +360,22 @@
 
     els.genBtn.addEventListener('click', async () => {
       const selected = Array.from(state.selected.values());
-      if (!selected.length) { pushAssistant('Select a few products first (cleanser, serum, moisturizer, SPF, etc.).'); return; }
+      if (!selected.length) {
+        pushAssistant('Select a few products first (cleanser, serum, moisturizer, SPF, etc.).');
+        return;
+      }
 
-      // Local preview routine (immediate)
+      // Local preview (immediate)
       const preview = buildRoutineFromSelected(selected);
-      pushAssistant('Here’s a quick preview based on your picks:', routineNode(preview));
+      document.querySelector('#routine-preview')?.remove();
+      const node = routineNode(preview);
+      node.id = 'routine-preview';
+      pushAssistant('Here’s a quick preview based on your picks:', node);
 
-      // AI-generated routine 
-      const payload = selected.map(({id, name, brand, category, description, image}) => ({id, name, brand, category, description, image}));
-      const aiReply = await callAI(state.chat, payload);
-      if (aiReply) pushAssistant(aiReply); else pushAssistant('I couldn’t reach the AI service. The preview routine above should still help!');
+      // Build messages for Worker → callAI expects only { messages }
+      const messages = buildMessagesForRoutine(selected, state.chat);
+      const aiReply = await callAI(messages);
+      pushAssistant(aiReply);
     });
 
     els.chatForm.addEventListener('submit', async (e) => {
@@ -357,16 +385,16 @@
       els.chatInput.value = '';
       pushUser(msg);
 
-      // Light profile extraction for better previews
+      // Lightweight profile extraction (optional)
       const stMatch = msg.match(/\b(dry|oily|combination|combo|normal|sensitive)\b/i);
       if (stMatch) state.user.skinType = stMatch[1].toLowerCase() === 'combination' ? 'combo' : stMatch[1].toLowerCase();
       const possible = ['acne','breakout','pigmentation','dark spot','wrinkle','redness','sensitivity','barrier','pores','dull'];
       state.user.concerns = possible.filter(c => new RegExp(c, 'i').test(msg)).map(c => c.replace(' ', ''));
 
       const selected = Array.from(state.selected.values());
-      const payload = selected.map(({id, name, brand, category, description}) => ({id, name, brand, category, description}));
-      const aiReply = await callAI(state.chat, payload);
-      pushAssistant(aiReply || 'Happy to help! Ask me about skincare, haircare, makeup, or fragrance.');
+      const messages = buildMessagesForFollowUp(selected, state.chat, msg);
+      const aiReply = await callAI(messages);
+      pushAssistant(aiReply);
     });
 
     // RTL toggle
