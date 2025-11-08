@@ -297,7 +297,7 @@
     const list = (title, arr) => $el('div', { class: 'routine-block' }, [
       $el('h3', {}, [title]),
       $el('ol', {}, arr.map(s => $el('li', {}, [
-        `${s.step}. ${s.stage}: `,
+        `${s.stage}: `,
         $el('strong', {}, [s.product.name]),
         ` (${s.product.brand})`
       ])))
