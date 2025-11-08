@@ -10,71 +10,42 @@
     chatInput: document.getElementById('userInput')
   };
 
-  // Inject search input beside the category filter
+  // Inject search input beside the category filter (idempotent; no CSS injected)
   (function ensureSearchInput() {
     const section = document.querySelector('.search-section');
     if (!section || document.getElementById('productSearch')) return;
     const wrap = document.createElement('div');
-    wrap.style.marginLeft = '12px';
-    wrap.style.flex = '1';
+    wrap.className = 'search-wrap';
     wrap.innerHTML = `
-      <input id="productSearch" type="search" placeholder="Search products…"
-             aria-label="Search products"
-             style="width:100%;padding:16px;font-size:16px;border:2px solid #000;border-radius:8px;" />
+      <input id="productSearch" type="search" placeholder="Search products…" aria-label="Search products" />
     `;
     section.appendChild(wrap);
   })();
 
-  // Inject RTL toggle in header
+  // Inject RTL toggle button (no CSS injected; your stylesheet handles [dir="rtl"])
   (function ensureRtlToggle() {
     if (document.getElementById('rtlToggle')) return;
     const header = document.querySelector('.site-header');
     if (!header) return;
     const btn = document.createElement('button');
     btn.id = 'rtlToggle';
+    btn.type = 'button';
     btn.textContent = 'RTL';
-    btn.style.cssText = 'margin-top:10px;border:2px solid #000;border-radius:8px;padding:6px 10px;background:#fff;cursor:pointer;';
     header.appendChild(btn);
   })();
 
   const searchInput = document.getElementById('productSearch');
   const rtlToggle = document.getElementById('rtlToggle');
 
-  // ---------- Brand accents via CSS variables (ff003b / e3a535) ----------
-  const BRAND_PRIMARY = '#ff003b';
-  const BRAND_SECONDARY = '#e3a535';
-  if (!document.getElementById('brand-vars')) {
-    const style = document.createElement('style');
-    style.id = 'brand-vars';
-    style.textContent = `
-      :root{ --brand-primary:${BRAND_PRIMARY}; --brand-secondary:${BRAND_SECONDARY}; }
-      .product-card.selected{ outline: 3px solid var(--brand-primary); outline-offset: 2px; }
-      .generate-btn{ background: var(--brand-primary) !important; }
-      .generate-btn:hover{ background: #d80033 !important; }
-      .bubble.user{ background: rgba(255,0,59,0.12); }
-      .routine-block{ border:1px dashed rgba(0,0,0,.15); }
-      .badge{ display:inline-block; font-size:11px; padding:3px 8px; border-radius:999px; background:rgba(227,165,53,.14); color:#5b430f; border:1px solid rgba(227,165,53,.45); }
-      .desc{ display:none; font-size:13px; color:#444; margin-top:8px; line-height:1.45; }
-      .desc.open{ display:block; }
-      .product-actions{ display:flex; gap:8px; align-items:center; margin-top:8px; }
-      .link-btn, .toggle-btn{ font-size:13px; border:1px solid #ccc; background:#fff; padding:6px 8px; border-radius:6px; cursor:pointer; }
-      .toggle-btn.active{ border-color: var(--brand-secondary); box-shadow:0 0 0 2px rgba(227,165,53,.25) inset; }
-      .selected-toolbar{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
-      .clear-all{ border:1px solid #ccc; background:#fff; padding:6px 10px; cursor:pointer; border-radius:6px; }
-      [dir="rtl"] .products-grid { direction: rtl; }
-      [dir="rtl"] .chat-form { direction: rtl; }
-      [dir="rtl"] .bubble.user { margin-right: auto; margin-left: 0; }
-    `;
-    document.head.appendChild(style);
-  }
-
   // ---------- State ----------
   const state = {
     products: [],
-    selected: new Map(), // id -> product
-    user: { skinType: null, concerns: [] },
+    productById: new Map(),
+    selected: new Map(),
     chat: [],
-    query: ''
+    query: localStorage.getItem('ui.search') || '',
+    filter: localStorage.getItem('ui.filter') || '',
+    user: { skinType: null, concerns: [] }
   };
 
   // ---------- Utils ----------
@@ -83,50 +54,73 @@
     for (const [k, v] of Object.entries(attrs)) {
       if (k === 'class') node.className = v;
       else if (k === 'dataset') Object.assign(node.dataset, v);
-      else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+      else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v, { passive: true });
       else node.setAttribute(k, v);
     }
-    children.forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+    for (const c of children) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
     return node;
   };
-  const ordinal = n => (['1st','2nd','3rd'][n-1] || `${n}th`);
-  const normalizeCategory = (c = '') => String(c).trim().toLowerCase();
+  const normalize = (s='') => String(s).trim().toLowerCase();
+  const safeSrc = (u)=> /^https?:\/\//i.test(u||'') ? u : (u ? u : 'about:blank');
+  const debounce = (fn, ms=120)=>{ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
 
   // ---------- Storage ----------
   const LS_KEY = 'selectedProducts.v1';
-  function saveSelected() {
-    const ids = Array.from(state.selected.keys());
-    localStorage.setItem(LS_KEY, JSON.stringify(ids));
-  }
+  function saveSelected() { localStorage.setItem(LS_KEY, JSON.stringify([...state.selected.keys()])); }
   function restoreSelected() {
     try {
       const raw = localStorage.getItem(LS_KEY);
       if (!raw) return;
-      const ids = JSON.parse(raw);
-      ids.forEach(id => {
-        const p = state.products.find(x => String(x.id) === String(id));
+      for (const id of JSON.parse(raw)) {
+        const p = state.productById.get(String(id));
         if (p) state.selected.set(p.id, p);
-      });
+      }
     } catch {}
   }
-  function clearAllSelected() {
-    state.selected.clear();
-    saveSelected();
-    renderSelected();
-    renderProducts();
+
+  // ---------- Stage classification ----------
+  function classifyStageFromText(cat,text) {
+    if (/(cleanser|wash|gel cleanser|cleansing balm|micellar)/.test(cat+text)) return 'cleanser';
+    if (/(moisturizer|cream|lotion|gel-cream|emulsion)/.test(cat+text)) return 'moisturizer';
+    if (/(suncare|sunscreen|spf)/.test(cat+text)) return 'spf';
+    if (/\beye\b/.test(cat+text)) return 'eye';
+    if (/(serum|treatment|booster|essence|ampoule|toner|exfoliant|mask)/.test(cat+text)) return 'treat';
+    return null;
   }
+  const STAGES = [
+    { key: 'cleanser',   label: 'Cleanser' },
+    { key: 'treat',      label: 'Treatment/Serum' },
+    { key: 'moisturizer',label: 'Moisturizer' },
+    { key: 'eye',        label: 'Eye' },
+    { key: 'spf',        label: 'Sunscreen (AM only)' }
+  ];
 
-  // ---------- Load & Init ----------
+  // ---------- Init ----------
+  document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();
+
   async function init() {
-    await loadProducts();
-    restoreSelected();
-    renderProducts();
-    renderSelected();
-    wireEvents();
-    pushAssistant("Hi! Pick a few products or tell me your skin goals. When you're ready, tap Generate Routine.");
+    if (searchInput) searchInput.value = state.query;
+    if (els.filter && state.filter) els.filter.value = state.filter;
 
+    await loadProducts();
+    indexProducts();       // precompute normalized fields once (O(N))
+    buildGridOnce();       // build DOM once (O(N))
+    restoreSelected();     // restore selections from LS
+    ensureSelectedToolbar();
+    renderSelected();      // render pills (O(S))
+    applyFilterAndSearch();// show/hide only (O(N))
+
+    wireEvents();
+
+    // Chat a11y
+    els.chatWin?.setAttribute('role','log');
+    els.chatWin?.setAttribute('aria-live','polite');
+
+    // Restore dir pref
     const dirPref = localStorage.getItem('ui.dir');
     if (dirPref) document.documentElement.setAttribute('dir', dirPref);
+
+    pushAssistant("Hi! Pick a few products or tell me your skin goals. When you're ready, tap Generate Routine.");
   }
 
   async function loadProducts() {
@@ -137,141 +131,176 @@
       state.products = Array.isArray(data) ? data : (data.products || []);
     } catch (e) {
       console.error(e);
+      state.products = [];
       pushAssistant("I couldn't load the product list. Please ensure products.json is available.");
     }
   }
 
-  // ---------- Render ----------
-  function filteredProducts() {
-    const cat = normalizeCategory(els.filter.value);
-    const q = state.query.toLowerCase();
-    return state.products.filter(p => {
-      const pc = normalizeCategory(p.category);
-      const inCat = !cat || pc === cat;
-      if (!inCat) return false;
-      if (!q) return true;
-      const hay = `${p.name} ${p.brand} ${p.category} ${p.description||''}`.toLowerCase();
-      return hay.includes(q);
-    });
+  // Precompute normalized/cached fields
+  function indexProducts() {
+    state.productById.clear();
+    for (const p of state.products) {
+      const nameL = normalize(p.name);
+      const brandL = normalize(p.brand);
+      const catL = normalize(p.category);
+      const descL = normalize(p.description||'');
+      const haystack = `${nameL} ${brandL} ${catL} ${descL}`;
+      const stage = classifyStageFromText(catL, ` ${nameL} ${descL}`);
+      p.__norm = { nameL, brandL, catL, descL, haystack, stage };
+      state.productById.set(String(p.id), p);
+    }
   }
 
-  function renderProducts() {
+  // ---------- Grid: build once, then patch/show/hide ----------
+  function buildGridOnce() {
+    if (!els.grid) return;
     els.grid.innerHTML = '';
-    const list = filteredProducts();
+    const frag = document.createDocumentFragment();
 
-    list.forEach(p => {
-      const isSelected = state.selected.has(p.id);
-      const card = $el('article', { class: `product-card${isSelected ? ' selected' : ''}`, dataset: { id: p.id } });
+    for (const p of state.products) {
+      const card = $el('article', {
+        class: 'product-card',
+        dataset: { id: p.id, cat: p.__norm.catL },
+        tabindex: '0'
+      });
 
-      const img = $el('img', { alt: p.name, src: p.image || '' });
-      const info = $el('div', { class: 'product-info' });
-      info.append(
+      const img = $el('img', { alt: p.name, src: safeSrc(p.image), loading: 'lazy' });
+      const info = $el('div', { class: 'product-info' }, [
         $el('h3', {}, [p.name]),
         $el('p', {}, [p.brand]),
         $el('span', { class: 'badge' }, [p.category])
-      );
+      ]);
 
-      const actions = $el('div', { class: 'product-actions' });
-      const desc = $el('div', { class: 'desc' }, [p.description || '']);
-      const toggleDesc = $el('button', { class: 'toggle-btn', onClick: (e) => {
-        e.stopPropagation();
-        desc.classList.toggle('open');
-        toggleDesc.classList.toggle('active');
-        toggleDesc.textContent = desc.classList.contains('open') ? 'Hide details' : 'Details';
-      }}, ['Details']);
-      const addBtn = $el('button', { class: 'add-btn', onClick: (e) => { e.stopPropagation(); toggleSelect(p); } }, [isSelected ? 'Remove' : 'Add']);
-      actions.append(toggleDesc, addBtn);
+      // Details (ARIA)
+      const descId = `desc-${p.id}`;
+      const desc = $el('div', { id: descId, class: 'desc', role:'region' }, [p.description || '']);
+      const toggleDesc = $el('button', {
+        class: 'toggle-btn',
+        'aria-expanded': 'false',
+        'aria-controls': descId
+      }, ['Details']);
+
+      const addBtn = $el('button', { class: 'add-btn' }, ['Add']);
+      const actions = $el('div', { class: 'product-actions' }, [toggleDesc, addBtn]);
 
       card.append(img, info, actions, desc);
-
-      card.addEventListener('click', (e) => {
-        if (e.target.closest('button')) return;
-        toggleSelect(p);
-      });
-
-      els.grid.appendChild(card);
-    });
+      frag.appendChild(card);
+    }
+    els.grid.appendChild(frag);
   }
 
+  // Show/hide by filter/search without rebuilding nodes
+  function applyFilterAndSearch() {
+    if (!els.grid) return;
+    const q = normalize(state.query);
+    const cat = normalize(state.filter);
+    const all = els.grid.children;
+
+    for (let i = 0; i < all.length; i++) {
+      const card = all[i];
+      const id = card.dataset.id;
+      const p = state.productById.get(String(id));
+      const inCat = !cat || cat === 'all' || p.__norm.catL === cat || p.__norm.catL.includes(cat);
+      const inSearch = !q || p.__norm.haystack.includes(q);
+      card.style.display = (inCat && inSearch) ? '' : 'none';
+
+      // keep selected visuals synced cheaply
+      const selected = state.selected.has(p.id);
+      if (selected !== card.classList.contains('selected')) {
+        card.classList.toggle('selected', selected);
+        const btn = card.querySelector('.add-btn');
+        if (btn) btn.textContent = selected ? 'Remove' : 'Add';
+      }
+    }
+  }
+
+  // Toggle selection; patch only affected card + pills
   function toggleSelect(p) {
     if (!p?.id) return;
     if (state.selected.has(p.id)) state.selected.delete(p.id); else state.selected.set(p.id, p);
     saveSelected();
     renderSelected();
-    renderProducts();
+
+    const card = els.grid?.querySelector(`.product-card[data-id="${p.id}"]`);
+    if (card) {
+      const isSel = state.selected.has(p.id);
+      card.classList.toggle('selected', isSel);
+      const btn = card.querySelector('.add-btn');
+      if (btn) btn.textContent = isSel ? 'Remove' : 'Add';
+    }
+  }
+
+  // ---------- Selected products UI ----------
+  function ensureSelectedToolbar() {
+    if (document.getElementById('selectedToolbar')) return;
+    const holder = document.querySelector('.selected-products');
+    if (!holder || !els.selected) return;
+    const bar = document.createElement('div');
+    bar.id = 'selectedToolbar';
+    bar.className = 'selected-toolbar';
+    bar.innerHTML = `<span class="hint">Click cards or use Add/Remove.</span><button class="clear-all" type="button">Clear all</button>`;
+    holder.insertBefore(bar, els.selected);
+    bar.querySelector('.clear-all').addEventListener('click', () => {
+      state.selected.clear();
+      saveSelected();
+      renderSelected();
+      applyFilterAndSearch();
+    }, { passive: true });
   }
 
   function renderSelected() {
-    if (!document.getElementById('selectedToolbar')) {
-      const holder = document.querySelector('.selected-products');
-      if (holder) {
-        const bar = document.createElement('div');
-        bar.id = 'selectedToolbar';
-        bar.className = 'selected-toolbar';
-        bar.innerHTML = `<span class="hint">Click cards or use Add/Remove.</span><button class="clear-all" type="button">Clear all</button>`;
-        holder.insertBefore(bar, els.selected);
-        bar.querySelector('.clear-all').addEventListener('click', clearAllSelected);
-      }
-    }
-
+    if (!els.selected) return;
     els.selected.innerHTML = '';
     if (state.selected.size === 0) {
-      els.selected.appendChild($el('div', { class: 'empty' }, ['No products selected yet.']));
+      els.selected.appendChild($el('div', { class: 'placeholder-message' }, ['No products selected yet.']));
       return;
     }
+    const frag = document.createDocumentFragment();
     state.selected.forEach(p => {
-      const pill = $el('div', { class: 'selected-pill' });
-      pill.append(
-        $el('img', { class: 'thumb', alt: p.name, src: p.image || '' }),
+      const pill = $el('div', { class: 'selected-pill' }, [
+        $el('img', { class: 'thumb', alt: p.name, src: safeSrc(p.image), loading:'lazy' }),
         $el('span', { class: 'label' }, [`${p.brand}: ${p.name}`]),
         $el('button', { class: 'remove', onClick: () => toggleSelect(p) }, ['×'])
-      );
-      els.selected.appendChild(pill);
+      ]);
+      frag.appendChild(pill);
     });
+    els.selected.appendChild(frag);
   }
 
-  // ---------- Routine preview (local, before AI) ----------
-  function classifyStage(p) {
-    const cat = normalizeCategory(p.category);
-    const text = `${p.name || ''} ${p.description || ''}`.toLowerCase();
-    if (cat.includes('cleanser')) return 'cleanser';
-    if (cat.includes('moisturizer')) return 'moisturizer';
-    if (cat.includes('suncare') || /\bspf\b|sunscreen/.test(text)) return 'spf';
-    if (cat.includes('skincare')) {
-      if (/\beye\b/.test(text)) return 'eye';
-      return 'treat';
-    }
-    return null;
-  }
-  const STAGES = [
-    { key: 'cleanser',   label: 'Cleanser',            match: p => classifyStage(p) === 'cleanser' },
-    { key: 'treat',      label: 'Treatment/Serum',     match: p => classifyStage(p) === 'treat' },
-    { key: 'moisturizer',label: 'Moisturizer',         match: p => classifyStage(p) === 'moisturizer' },
-    { key: 'eye',        label: 'Eye',                 match: p => classifyStage(p) === 'eye' },
-    { key: 'spf',        label: 'Sunscreen (AM only)', match: p => classifyStage(p) === 'spf' }
-  ];
+  // ---------- Routine preview (local) ----------
   function buildRoutineFromSelected(selectedList) {
-    const eligible = selectedList.filter(p => ['cleanser','moisturizer','suncare','skincare'].includes(normalizeCategory(p.category)) && classifyStage(p));
-    const byStage = STAGES.reduce((acc, s) => (acc[s.key] = eligible.filter(s.match), acc), {});
-    const am = [], pm = [];
+    const elig = selectedList.filter(p => p.__norm.stage && ['cleanser','moisturizer','spf','treat','eye'].includes(p.__norm.stage));
+    const byStage = { cleanser:[], treat:[], moisturizer:[], eye:[], spf:[] };
+    for (const p of elig) byStage[p.__norm.stage].push(p);
+
+    const am=[], pm=[];
+    const pushAm = (stage, p)=>am.push({ stage, product:p });
+    const pushPm = (stage, p)=>pm.push({ stage, product:p });
+
     for (const s of STAGES) {
-      (byStage[s.key] || []).forEach(p => {
-        const tags = `${p.name} ${p.description || ''}`.toLowerCase();
-        if (s.key === 'spf') am.push({ stage: s.label, product: p });
-        else if (/exfoliant|retinol|retinal|adapalene|salicylic|\bbha\b|\baha\b|glycolic|lactic|benzoyl/.test(tags)) pm.push({ stage: s.label, product: p });
-        else if (/vitamin\s*c/.test(tags)) am.push({ stage: s.label, product: p });
-        else if (/\beye\b/.test(tags) && s.key === 'eye') { am.push({ stage: s.label, product: p }); pm.push({ stage: s.label, product: p }); }
-        else { am.push({ stage: s.label, product: p }); pm.push({ stage: s.label, product: p }); }
-      });
+      const list = byStage[s.key];
+      if (!list || !list.length) continue;
+      const p = list[0]; // cap to one per stage by default
+      const tags = `${p.__norm.nameL} ${p.__norm.descL}`;
+      if (s.key === 'spf') pushAm(s.label, p);
+      else if (/(exfoliant|retinol|retinal|adapalene|salicylic|\bbha\b|\baha\b|glycolic|lactic|benzoyl)/.test(tags)) pushPm(s.label, p);
+      else if (/vitamin\s*c/.test(tags)) pushAm(s.label, p);
+      else if (s.key === 'eye') { pushAm(s.label, p); pushPm(s.label, p); }
+      else { pushAm(s.label, p); pushPm(s.label, p); }
     }
     am.forEach((x,i)=>x.step=i+1); pm.forEach((x,i)=>x.step=i+1);
     return { am, pm };
   }
+
   function routineNode(r) {
     const wrap = $el('div', { class: 'routine' });
     const list = (title, arr) => $el('div', { class: 'routine-block' }, [
       $el('h3', {}, [title]),
-      $el('ol', {}, arr.map(s => $el('li', {}, [ `${s.step}. ${s.stage}: `, $el('strong', {}, [s.product.name]), ` (${s.product.brand})` ])))
+      $el('ol', {}, arr.map(s => $el('li', {}, [
+        `${s.step}. ${s.stage}: `,
+        $el('strong', {}, [s.product.name]),
+        ` (${s.product.brand})`
+      ])))
     ]);
     wrap.append(list('AM Routine', r.am), list('PM Routine', r.pm));
     return wrap;
@@ -281,45 +310,42 @@
   function pushUser(text) { state.chat.push({ role: 'user', content: text }); appendBubble('user', text); }
   function pushAssistant(text, node) { state.chat.push({ role: 'assistant', content: text }); appendBubble('assistant', text, node); }
   function appendBubble(role, text, htmlNode) {
+    if (!els.chatWin) return;
     const bubble = $el('div', { class: `bubble ${role}` });
     if (htmlNode) bubble.appendChild(htmlNode); else bubble.appendChild($el('p', {}, [text]));
-    els.chatWin.appendChild(bubble); els.chatWin.scrollTop = els.chatWin.scrollHeight;
+    els.chatWin.appendChild(bubble);
+    els.chatWin.scrollTop = els.chatWin.scrollHeight;
   }
 
-  // ---------- AI (your Worker returns raw OpenAI JSON) ----------
+  // ---------- AI (Worker) ----------
   const WORKER_URL = 'https://project8-chatbot.myin5.workers.dev/';
 
   async function callAI(messages) {
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(), 20000);
     try {
       const res = await fetch(WORKER_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages })
+        body: JSON.stringify({ messages }),
+        signal: ctrl.signal
       });
       const text = await res.text();
-      console.log('[AI] status=', res.status, 'body=', text);
       if (!res.ok) return `⚠️ Worker error ${res.status}: ${text}`;
-
-      let data;
-      try { data = JSON.parse(text); } catch { return '⚠️ Worker returned invalid JSON.'; }
-
-      if (data.error) {
-        const msg = data.error.message || data.error || 'Unknown OpenAI error.';
-        return `⚠️ OpenAI error: ${msg}`;
-      }
+      let data; try { data = JSON.parse(text); } catch { return '⚠️ Worker returned invalid JSON.'; }
+      if (data?.error) return `⚠️ OpenAI error: ${data.error.message || data.error}`;
       const content = data?.choices?.[0]?.message?.content;
-      if (!content) return '⚠️ No content in OpenAI response.';
-      return String(content).trim();
+      return content ? String(content).trim() : '⚠️ No content in OpenAI response.';
     } catch (e) {
-      console.error('[AI] fetch failed:', e);
-      return `⚠️ ${e.message || 'AI request failed'}`;
-    }
+      return `⚠️ ${e.name === 'AbortError' ? 'AI request timed out' : (e.message || 'AI request failed')}`;
+    } finally { clearTimeout(t); }
   }
 
-  // Guardrail + context to include selected products in messages
+  // Guardrail + context (ask model to include visible citations for real-world facts)
   const SYSTEM_PROMPT =
     "You are a L’Oréal-focused advisor. Stay on topics: skincare, haircare, makeup, fragrance. " +
     "Use only the provided selected product JSON and user questions to create AM/PM routines and give follow-ups. " +
+    "When stating real-world facts, include a short citation with a visible URL. If you can’t verify, say so. " +
     "Be practical, concise, and safe. If something is outside scope, briefly say so.";
 
   function buildMessagesForRoutine(selectedProducts, chatHistory) {
@@ -335,7 +361,6 @@
       { role: 'user', content: "Generate a clear AM/PM routine using only the selected products. Then ask one short follow-up question." }
     ];
   }
-
   function buildMessagesForFollowUp(selectedProducts, chatHistory, userMsg) {
     const context = {
       selectedProducts: selectedProducts.map(p => ({
@@ -352,52 +377,57 @@
 
   // ---------- Events ----------
   function wireEvents() {
-    els.filter.addEventListener('change', renderProducts);
-    if (searchInput) searchInput.addEventListener('input', (e) => {
-      state.query = e.target.value || '';
-      renderProducts();
-    });
+    if (els.filter) els.filter.addEventListener('change', () => {
+      state.filter = els.filter.value || '';
+      localStorage.setItem('ui.filter', state.filter);
+      requestAnimationFrame(applyFilterAndSearch);
+    }, { passive: true });
 
-    els.genBtn.addEventListener('click', async () => {
-      const selected = Array.from(state.selected.values());
-      if (!selected.length) {
-        pushAssistant('Select a few products first (cleanser, serum, moisturizer, SPF, etc.).');
-        return;
-      }
+    if (searchInput) {
+      const onInput = debounce((e) => {
+        state.query = e.target.value || '';
+        localStorage.setItem('ui.search', state.query);
+        applyFilterAndSearch();
+      }, 120);
+      searchInput.addEventListener('input', onInput);
+    }
 
-      // Local preview (immediate)
-      const preview = buildRoutineFromSelected(selected);
-      document.querySelector('#routine-preview')?.remove();
-      const node = routineNode(preview);
-      node.id = 'routine-preview';
-      pushAssistant('Here’s a quick preview based on your picks:', node);
+    // Event delegation for grid clicks + keyboard
+    if (els.grid) {
+      els.grid.addEventListener('click', (e) => {
+        const card = e.target.closest('.product-card');
+        if (!card) return;
+        const id = card.dataset.id;
+        const p = state.productById.get(String(id));
+        if (!p) return;
 
-      // Build messages for Worker → callAI expects only { messages }
-      const messages = buildMessagesForRoutine(selected, state.chat);
-      const aiReply = await callAI(messages);
-      pushAssistant(aiReply);
-    });
+        if (e.target.classList.contains('toggle-btn')) {
+          const desc = card.querySelector('.desc');
+          const open = !desc.classList.contains('open');
+          desc.classList.toggle('open', open);
+          e.target.classList.toggle('active', open);
+          e.target.textContent = open ? 'Hide details' : 'Details';
+          e.target.setAttribute('aria-expanded', String(open));
+          return;
+        }
+        if (e.target.classList.contains('add-btn') || e.target === card || e.target.closest('.product-info')) {
+          toggleSelect(p);
+        }
+      });
 
-    els.chatForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const msg = els.chatInput.value.trim();
-      if (!msg) return;
-      els.chatInput.value = '';
-      pushUser(msg);
+      els.grid.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const card = e.target.closest('.product-card');
+        if (!card) return;
+        e.preventDefault();
+        const p = state.productById.get(String(card.dataset.id));
+        if (p) toggleSelect(p);
+      });
+    }
 
-      // Lightweight profile extraction (optional)
-      const stMatch = msg.match(/\b(dry|oily|combination|combo|normal|sensitive)\b/i);
-      if (stMatch) state.user.skinType = stMatch[1].toLowerCase() === 'combination' ? 'combo' : stMatch[1].toLowerCase();
-      const possible = ['acne','breakout','pigmentation','dark spot','wrinkle','redness','sensitivity','barrier','pores','dull'];
-      state.user.concerns = possible.filter(c => new RegExp(c, 'i').test(msg)).map(c => c.replace(' ', ''));
+    if (els.genBtn) els.genBtn.addEventListener('click', onGenerate);
+    if (els.chatForm) els.chatForm.addEventListener('submit', onChatSubmit);
 
-      const selected = Array.from(state.selected.values());
-      const messages = buildMessagesForFollowUp(selected, state.chat, msg);
-      const aiReply = await callAI(messages);
-      pushAssistant(aiReply);
-    });
-
-    // RTL toggle
     if (rtlToggle) rtlToggle.addEventListener('click', () => {
       const current = document.documentElement.getAttribute('dir') || 'ltr';
       const next = current === 'rtl' ? 'ltr' : 'rtl';
@@ -406,6 +436,47 @@
     });
   }
 
-  // ---------- Kickoff ----------
-  document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();
+  async function onGenerate() {
+    const selected = [...state.selected.values()];
+    if (!selected.length) {
+      pushAssistant('Select a few products first (cleanser, serum, moisturizer, SPF, etc.).');
+      return;
+    }
+
+    if (els.genBtn) { els.genBtn.disabled = true; var oldTxt = els.genBtn.textContent; els.genBtn.textContent = 'Generating…'; }
+
+    // Local preview (cheap)
+    document.querySelector('#routine-preview')?.remove();
+    const preview = buildRoutineFromSelected(selected);
+    const node = routineNode(preview); node.id = 'routine-preview';
+    pushAssistant('Here’s a quick preview based on your picks:', node);
+
+    try {
+      const messages = buildMessagesForRoutine(selected, state.chat);
+      const aiReply = await callAI(messages);
+      pushAssistant(aiReply);
+    } finally {
+      if (els.genBtn) { els.genBtn.disabled = false; els.genBtn.textContent = oldTxt || 'Generate'; }
+    }
+  }
+
+  async function onChatSubmit(e) {
+    e.preventDefault();
+    const msg = els.chatInput.value.trim();
+    if (!msg) return;
+    els.chatInput.value = '';
+    pushUser(msg);
+    els.chatInput.focus();
+
+    // lightweight profile extraction
+    const stMatch = msg.match(/\b(dry|oily|combination|combo|normal|sensitive)\b/i);
+    if (stMatch) state.user.skinType = stMatch[1].toLowerCase() === 'combination' ? 'combo' : stMatch[1].toLowerCase();
+    const possible = ['acne','breakout','pigmentation','dark spot','wrinkle','redness','sensitivity','barrier','pores','dull'];
+    state.user.concerns = possible.filter(c => new RegExp(c, 'i').test(msg)).map(c => c.replace(' ', ''));
+
+    const selected = [...state.selected.values()];
+    const messages = buildMessagesForFollowUp(selected, state.chat, msg);
+    const aiReply = await callAI(messages);
+    pushAssistant(aiReply);
+  }
 })();
